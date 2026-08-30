@@ -1,0 +1,123 @@
+version: "3.8"
+
+# Full topology matching this project's target architecture. NOT
+# executed/verified in this project's development environment — no
+# Docker or network access there. Correct compose syntax against known,
+# documented images; verify this actually boots and behaves as
+# described once run somewhere with real Docker + enough resources
+# (expect to need a multi-core, 16GB+ RAM host at minimum — this is a
+# genuinely heavy stack, unlike this portfolio's other, lighter Hugging
+# Face Space deployments).
+#
+# Batch-fusion MVP scope: NiFi's job here is "reliably land the two
+# synthetic source feeds into HDFS," not real-time Kafka-driven fusion
+# (that's the documented next step in docs/architecture.md). Kafka and
+# ZooKeeper are included now so the topology matches the target
+# architecture end to end, even though the batch MVP doesn't yet route
+# live events through them.
+
+services:
+  zookeeper:
+    image: zookeeper:3.9
+    ports:
+      - "2181:2181"
+    environment:
+      ZOO_MY_ID: 1
+
+  kafka:
+    image: bitnami/kafka:3.7
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_CFG_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+
+  nifi:
+    image: apache/nifi:1.27.0
+    depends_on:
+      - kafka
+      - namenode
+    ports:
+      - "8443:8443"
+    environment:
+      NIFI_WEB_HTTPS_PORT: 8443
+      SINGLE_USER_CREDENTIALS_USERNAME: admin
+      SINGLE_USER_CREDENTIALS_PASSWORD: ${NIFI_ADMIN_PASSWORD}
+    volumes:
+      - ./docker/nifi-flow.xml:/opt/nifi/nifi-current/conf/flow.xml.gz:ro
+      - ./data/landing:/opt/nifi/landing
+
+  namenode:
+    image: apache/hadoop:3.3.6
+    command: ["hdfs", "namenode"]
+    ports:
+      - "9870:9870"
+    environment:
+      ENSURE_NAMENODE_DIR: /tmp/hadoop/dfs/name
+    volumes:
+      - hdfs-namenode:/tmp/hadoop/dfs/name
+
+  datanode:
+    image: apache/hadoop:3.3.6
+    command: ["hdfs", "datanode"]
+    depends_on:
+      - namenode
+    volumes:
+      - hdfs-datanode:/tmp/hadoop/dfs/data
+
+  spark-master:
+    image: bitnami/spark:3.5
+    environment:
+      SPARK_MODE: master
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+
+  spark-worker:
+    image: bitnami/spark:3.5
+    depends_on:
+      - spark-master
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+    volumes:
+      - ./fusion:/opt/fusion:ro
+
+  accumulo:
+    image: apache/accumulo:2.1.2
+    depends_on:
+      - zookeeper
+      - namenode
+    ports:
+      - "9995:9995"
+      - "9099:9099"
+    environment:
+      ZOOKEEPER_HOST: zookeeper:2181
+      HDFS_NAMENODE: namenode:9000
+      ACCUMULO_ROOT_PASSWORD: ${ACCUMULO_ROOT_PASSWORD}
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms1g -Xmx1g"
+    ports:
+      - "9200:9200"
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.15.0
+    depends_on:
+      - elasticsearch
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+
+volumes:
+  hdfs-namenode:
+  hdfs-datanode:

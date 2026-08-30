@@ -1,0 +1,9 @@
+pyspark>=3.5.0
+elasticsearch>=8.15.0
+
+# Accumulo Python client — package name/version depends on your
+# cluster's Accumulo version and available connector (Thrift proxy
+# client vs. newer gRPC-based options). Pin this to match whatever
+# Accumulo image version docker-compose.yml actually uses once verified
+# against a real cluster.
+# pyaccumulo>=1.5.0

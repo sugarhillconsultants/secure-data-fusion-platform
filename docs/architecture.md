@@ -59,11 +59,12 @@ necessary to prove this project's core thesis.
 | `security/visibility.py` (visibility expression parser/evaluator) | **Yes** — 9 tests, including safety-critical denial cases and Accumulo's real mixed-operator ambiguity rule |
 | `ingestion/generator.py` (synthetic CTI fusion data) | **Yes** — 5 tests, confirms correct fusion scenario (entity overlap, correct classification distribution, determinism) |
 | `security/accumulo_sim.py` (access-control simulation + ES projection) | **Yes** — 5 tests, including the constructed adversarial-cell proof and the full 100-entity end-to-end demonstration |
-| `docker/docker-compose.yml` — ZooKeeper, HDFS (namenode+datanode) | **Yes** — run for real on a live Azure VM, confirmed independently via HDFS's own JMX endpoint reporting `"State": "active"` |
-| `docker/docker-compose.yml` — Accumulo (init, manager, tserver) | **Yes** — run for real, confirmed independently via direct HDFS filesystem inspection showing genuine `.rf` data files and write-ahead logs, after 11 distinct real bugs found and fixed (see `docs/incidents.md` #3) |
+| `docker/docker-compose.yml` — ZooKeeper, HDFS (namenode+datanode) | **Yes** — run for real on a live Azure VM; also **confirmed to survive a genuine stop/restart cycle end to end** (see `docs/incidents.md` #4), not just a single continuous session |
+| `docker/docker-compose.yml` — Accumulo (init, manager, tserver) | **Yes** — run for real, confirmed independently via direct HDFS filesystem inspection showing genuine `.rf` data files and write-ahead logs; also confirmed to survive a genuine restart with zero manual intervention, after 17 total distinct real bugs found and fixed across two sessions (see `docs/incidents.md` #3 and #4) |
 | `docker/docker-compose.yml` — Elasticsearch, Kibana | **Yes** — both running and healthy (`Cluster health status ... [GREEN]`) throughout the above |
-| `docker/docker-compose.yml` — Kafka, NiFi, Spark, the Accumulo Monitor UI | **Not yet run** — this project's trimmed first test deliberately excluded these; see "what's left" below |
-| `fusion/spark_fusion_job.py` (real Spark to Accumulo pipeline) | Correct code against documented APIs — **not yet executed against the now-working cluster** |
+| `docker/docker-compose.yml` — Kafka, NiFi, Spark, the Accumulo Monitor UI | **Not yet run** — this project's trimmed first tests deliberately excluded these; see "what's left" below |
+| `fusion/spark_fusion_job.py` (Spark transform, writes fused TSV to HDFS) | Rewritten to remove a dependency on `pyaccumulo` (unverified maintenance status — see `docs/incidents.md`); correct code against documented Spark APIs, **not yet executed** |
+| `fusion/AccumuloBulkWriter.java` (separate Java program, real BatchWriter API) | Written against Accumulo's current, documented `AccumuloClient` API — **not yet compiled or run**; no Java compiler exists in this project's development environment, so this has only been checked for balanced braces/parens |
 | `fusion/es_projection_writer.py` (real ES bulk-indexer) | Correct code against documented API — **not yet executed against the now-working cluster** |
 
 ## What it would take to close the remaining gap
@@ -71,24 +72,29 @@ necessary to prove this project's core thesis.
 1. ~~Provision a host with enough resources~~ — **done**: a real Azure
    `Standard_D4s_v4` VM (4 vCPU, 16GB RAM).
 2. ~~`docker compose up`, work through whatever breaks~~ — **done**:
-   11 distinct real issues found and fixed in sequence, fully documented
-   in `docs/incidents.md` #3, from a nonexistent Docker image through a
-   bash operator-precedence race condition to Accumulo's own internal
-   confirmation-prompt handling.
-3. **Still open**: run `fusion/spark_fusion_job.py` and
-   `fusion/es_projection_writer.py` against this now-working cluster,
-   and confirm the resulting Accumulo table matches what the simulator
-   already proved — three clearance levels tested, zero classified
-   leakage into the real Elasticsearch index, not just the in-memory
-   simulation.
-4. **Still open**: bring up Kafka, NiFi, and Spark (the services
-   deliberately excluded from this first trimmed test) and confirm they
+   11 distinct real issues found and fixed in the first session, fully
+   documented in `docs/incidents.md` #3.
+3. ~~Confirm the stack survives a real restart, not just one continuous
+   session~~ — **done**: a second session, after actually stopping and
+   restarting the VM overnight, found and fixed 6 more distinct issues
+   (`docs/incidents.md` #4), the most significant being that ZooKeeper
+   had no persistent volume at all. Confirmed working: a full
+   `docker compose down`/`up` cycle now succeeds with zero manual steps.
+4. **Immediate next step**: compile and run `fusion/AccumuloBulkWriter.java`
+   inside the `accumulo` container (see `fusion/README.md` for the exact
+   commands), and run `fusion/spark_fusion_job.py` against this now-working,
+   now-persistent cluster — confirming the resulting Accumulo table
+   matches what the simulator already proved: three clearance levels
+   tested, zero classified leakage into the real Elasticsearch index,
+   not just the in-memory simulation.
+5. **Still open**: bring up Kafka, NiFi, and Spark (deliberately
+   excluded from the trimmed persistence tests) and confirm they
    integrate correctly with the now-proven ZooKeeper/HDFS/Accumulo core.
-5. **Still open, minor**: the Accumulo Monitor web UI (port 9995) never
+6. **Still open, minor**: the Accumulo Monitor web UI (port 9995) never
    came up, since the current startup command only launches `manager`
    and `tserver`. Not required to prove the core thesis, but a real,
    known gap worth closing for a fuller demo.
-6. The real-time fusion evolution (NiFi/Kafka routing live per-event
+7. The real-time fusion evolution (NiFi/Kafka routing live per-event
    updates instead of batch files) and RFile bulk-load (replacing the
    BatchWriter approach for production-scale ingestion) remain the
    larger, longer-term next steps after that.

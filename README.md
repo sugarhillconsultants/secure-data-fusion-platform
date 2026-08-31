@@ -23,23 +23,30 @@ end-to-end run across 100 synthetic entities (574 total cells, three
 different clearance levels tested against the same data) that asserts
 **zero classified values ever appear in the Elasticsearch projection**.
 
-## Status: core security logic AND the real distributed stack both verified
+## Status: core security logic AND the real distributed stack both verified — including surviving a genuine restart
 
 Everything in `security/`, `ingestion/`, and `tests/` runs with zero
 external dependencies, verified with 19 passing tests (see
 [`docs/incidents.md`](docs/incidents.md) #1-2 for two genuine findings
 from that work). Beyond that: **ZooKeeper, HDFS, and Accumulo have now
 actually been run for real**, on a live Azure VM — not just written
-and assumed to work. Getting there took 11 distinct, real bugs, each
-found from an actual error and fixed in sequence (a nonexistent Docker
-image, missing Hadoop XML config, a Docker volume-ownership mismatch, a
-bash operator-precedence race condition, and Accumulo's own internal
-confirmation-prompt handling, among others — see
-[`docs/incidents.md`](docs/incidents.md) #3 for the full account).
-Confirmed independently two ways: HDFS's own JMX endpoint reporting
-`"State": "active"`, and a direct HDFS filesystem listing showing
-genuine Accumulo data files and write-ahead logs. Elasticsearch and
-Kibana were also confirmed running and healthy throughout. Kafka, NiFi,
+and assumed to work, and **confirmed to survive a genuine stop/restart
+cycle end to end with zero manual intervention**, not just one
+continuous session. Getting there took 17 distinct, real bugs across
+two sessions, each found from an actual error and fixed in sequence —
+a nonexistent Docker image, missing Hadoop XML config, a Docker
+volume-ownership mismatch, a bash operator-precedence race condition,
+Accumulo's own internal confirmation-prompt handling, a classic
+`depends_on`-doesn't-mean-ready race, and — the deepest of all —
+ZooKeeper silently having no persistent volume at all (see
+[`docs/incidents.md`](docs/incidents.md) #3 and #4 for the full
+account). Confirmed independently: HDFS's own JMX endpoint reporting
+`"State": "active"`, a direct HDFS filesystem listing showing genuine
+Accumulo data files and write-ahead logs, and — after the restart
+fixes — Accumulo's own crash-recovery log messages confirming its
+internal consistency checks passed cleanly against the persisted data.
+Elasticsearch and Kibana were also confirmed running and healthy
+throughout. Kafka, NiFi,
 Spark, and the actual Spark→Accumulo fusion job remain unexecuted —
 see [`docs/architecture.md`](docs/architecture.md) for the precise,
 current split.

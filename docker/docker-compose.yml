@@ -164,6 +164,9 @@ services:
     ports:
       - "8080:8080"
       - "7077:7077"
+    volumes:
+      - ./fusion:/opt/fusion:ro
+      - ./ingestion:/opt/ingestion:ro
 
   spark-worker:
     image: bitnami/spark:3.5
@@ -174,6 +177,7 @@ services:
       SPARK_MASTER_URL: spark://spark-master:7077
     volumes:
       - ./fusion:/opt/fusion:ro
+      - ./ingestion:/opt/ingestion:ro
 
   accumulo:
     # NOTE: there is no official prebuilt apache/accumulo image on Docker

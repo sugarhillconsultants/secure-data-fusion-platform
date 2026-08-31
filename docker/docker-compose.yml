@@ -21,6 +21,25 @@ services:
       - "2181:2181"
     environment:
       ZOO_MY_ID: 1
+    # THE ACTUAL ROOT CAUSE of today's repeated Accumulo
+    # "instance name" NullPointerExceptions, corrected here: this
+    # service had NO persistent volume at all — every single restart
+    # wiped ZooKeeper's entire state from scratch, including the
+    # instance-name-to-ID mapping Accumulo's Manager/tserver need to
+    # resolve "docker-instance" by name. Accumulo's actual table DATA
+    # lives safely in HDFS (which does persist correctly, confirmed by
+    # the "already initialized" check succeeding), but the METADATA
+    # linking the human-readable name to that data lives in ZooKeeper —
+    # which was silently reset to empty on every restart, unrelated to
+    # anything Accumulo's own init logic does. An earlier theory (that
+    # unconditionally passing --clear-instance-name was destructively
+    # corrupting this mapping) was a real, valid concern worth fixing
+    # too, but was NOT the root cause of this specific symptom
+    # persisting across a plain `docker compose down`/`up` cycle with
+    # no repeated init calls involved at all. See docs/incidents.md.
+    volumes:
+      - zookeeper-data:/data
+      - zookeeper-datalog:/datalog
 
   kafka:
     image: bitnami/kafka:3.7
@@ -68,7 +87,54 @@ services:
     # actual failure: "Invalid URI for NameNode address (check
     # fs.defaultFS): file:/// has no authority." Fixed via the mounted
     # core-site.xml/hdfs-site.xml below.
-    command: ["bash", "-c", "hdfs namenode -format -force -nonInteractive && hdfs namenode"]
+    # NOTE: an earlier version of this command always reformatted HDFS
+    # on every single container start — a reasonable simplification
+    # during rapid same-session debugging (yesterday's attempt at a
+    # conditional "format only if needed" check behaved oddly and was
+    # abandoned in favor of always-format). That decision turned out to
+    # be fundamentally incompatible with the very thing being tested
+    # today: real data persistence across an actual VM stop/restart
+    # cycle. Confirmed the hard way — after restarting this VM, the
+    # exact same "Permission denied creating /accumulo" error from
+    # yesterday recurred, because every namenode restart wiped HDFS's
+    # metadata clean, including the manually-chowned /accumulo
+    # directory. This also explains why datanode exited: a freshly
+    # reformatted namenode gets a new cluster ID that no longer matches
+    # datanode's own persisted storage — HDFS correctly refuses to let
+    # a datanode with a mismatched cluster ID join, a real safety
+    # mechanism, not a bug. Fixed properly this time by checking for
+    # the actual VERSION file (the file Hadoop writes as the final step
+    # of a successful format) rather than just the parent directory's
+    # existence — more precise, since a directory can exist without a
+    # complete VERSION file if an earlier attempt was interrupted
+    # partway through. See docs/incidents.md.
+    command: >
+      bash -c "
+      if [ ! -f /tmp/hadoop/dfs/name/current/VERSION ]; then
+        hdfs namenode -format -force -nonInteractive;
+      fi;
+      hdfs namenode
+      "
+    # NOTE: `depends_on` alone only waits for a container to START, not
+    # for the service inside it to be READY — confirmed the hard way:
+    # accumulo failed with "Connection refused" to namenode:9000 even
+    # though namenode's own container was already "Up" and its web UI
+    # (port 9870) was already reporting healthy. The web UI and the
+    # actual RPC port (9000, the one clients use) don't necessarily
+    # become ready at the same moment — this bit us specifically when
+    # multiple services were brought up in a single `docker compose up`
+    # command, giving namenode less of a head start than it had gotten
+    # in earlier, separate debugging sessions. This healthcheck tests
+    # the real RPC port directly (via `hdfs dfsadmin -report`, using
+    # the same client tooling already on this image) so dependents can
+    # wait for genuine readiness, not just container start. See
+    # docs/incidents.md.
+    healthcheck:
+      test: ["CMD-SHELL", "hdfs dfsadmin -report >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
     ports:
       - "9870:9870"
     volumes:
@@ -84,7 +150,8 @@ services:
     user: "root"
     command: ["hdfs", "datanode"]
     depends_on:
-      - namenode
+      namenode:
+        condition: service_healthy
     volumes:
       - hdfs-datanode:/tmp/hadoop/dfs/data
       - ./hadoop-config/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro
@@ -154,17 +221,46 @@ services:
     # sequential statement (semicolon-separated, not &&-chained into
     # the same backgroundable unit) with an explicit exit-code check,
     # so manager/tserver only ever start after init has actually and
-    # verifiably completed. See docs/incidents.md.
+    # verifiably completed.
+    #
+    # --clear-instance-name added after a further real finding: -f/
+    # --force and --clear-instance-name are TWO DISTINCT confirmation
+    # prompts in Accumulo's own init code (confirmed by reading
+    # Initialize.java directly) — -f suppresses the security-info-reset
+    # prompt, --clear-instance-name suppresses the separate "this
+    # instance name already exists" prompt. Repeated init attempts
+    # against the same ZooKeeper state (this compose file's accumulo
+    # service was retried several times without a full `down -v` wipe
+    # each time) left a stale "docker-instance" registration behind,
+    # triggering the second prompt — which calls
+    # System.console().readLine(), returning null with no tty attached
+    # (a background daemon container has none), causing a
+    # NullPointerException. See docs/incidents.md.
     command:
       - >
-        accumulo init --instance-name docker-instance --password $$ACCUMULO_ROOT_PASSWORD -f --clear-instance-name;
-        if [ $$? -ne 0 ]; then echo "Accumulo init failed" >&2; exit 1; fi;
+        INIT_OUTPUT=$$(accumulo init --instance-name docker-instance --password $$ACCUMULO_ROOT_PASSWORD -f 2>&1);
+        INIT_EXIT=$$?;
+        echo "$$INIT_OUTPUT";
+        if [ $$INIT_EXIT -ne 0 ]; then
+          if echo "$$INIT_OUTPUT" | grep -q "already initialized"; then
+            echo "Accumulo already initialized - continuing to start manager/tserver";
+          elif echo "$$INIT_OUTPUT" | grep -qi "instance name.*exists"; then
+            echo "Instance name collision detected - retrying with --clear-instance-name";
+            accumulo init --instance-name docker-instance --password $$ACCUMULO_ROOT_PASSWORD -f --clear-instance-name;
+            if [ $$? -ne 0 ]; then echo "Accumulo init failed even with --clear-instance-name" >&2; exit 1; fi;
+          else
+            echo "Accumulo init failed for a real reason" >&2;
+            exit 1;
+          fi
+        fi;
         accumulo manager &
         accumulo tserver &
         wait -n
     depends_on:
-      - zookeeper
-      - namenode
+      zookeeper:
+        condition: service_started
+      namenode:
+        condition: service_healthy
     ports:
       - "9995:9995"
       - "9099:9099"
@@ -212,3 +308,5 @@ services:
 volumes:
   hdfs-namenode:
   hdfs-datanode:
+  zookeeper-data:
+  zookeeper-datalog:

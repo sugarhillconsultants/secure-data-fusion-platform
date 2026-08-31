@@ -57,6 +57,142 @@ differently in this project's simulator than it would in real
 Accumulo defeats the entire point of building the simulator to
 validate this logic in the first place.
 
+## 3. Running this for real: eleven distinct root causes, found on a real Azure VM
+
+Everything below happened running the actual `docker-compose.yml`
+stack (trimmed to ZooKeeper, HDFS, Accumulo, Elasticsearch, Kibana) on
+a real Azure `Standard_D4s_v4` VM (4 vCPU, 16GB RAM) — genuinely
+different territory from the pure-Python logic above, and, as
+predicted, it did not work on the first attempt. Every fix below was
+driven by an actual error message or a direct inspection of the
+running system, not guessed.
+
+**3a. `apache/accumulo:2.1.2` is not a real Docker Hub image.**
+First failure: `pull access denied for apache/accumulo, repository
+does not exist`. Confirmed by checking Apache's own `accumulo-docker`
+GitHub repo directly — its README states plainly there is no official
+prebuilt image yet, and you must build it yourself. Fixed by cloning
+that repo and running its own `docker build`, which — coincidentally —
+defaults to exactly Accumulo 2.1.2 + Hadoop 3.3.6 + ZooKeeper 3.8.2,
+matching the versions already chosen elsewhere in this compose file.
+
+**3b. `fs.defaultFS` was never actually configured — Hadoop needs XML
+config files, not environment variables.** The `namenode` container
+crashed with `Invalid URI for NameNode address (check fs.defaultFS):
+file:/// has no authority`. The original compose file used a made-up
+environment variable (`ENSURE_NAMENODE_DIR`) that this image never
+recognized — Hadoop's actual configuration model is XML files
+(`core-site.xml`, `hdfs-site.xml`), not arbitrary env vars the way
+Kafka or Elasticsearch support. Fixed by writing real config files and
+mounting them into the container.
+
+**3c. HDFS needs a one-time format, and a conditional "format only if
+needed" check failed in an unclear way.** A first attempt at an
+idempotent startup command (`if [ ! -d .../current ]; then format; fi`)
+failed with `storage directory does not exist or is not accessible`
+even on a freshly-wiped volume — the exact cause wasn't conclusively
+identified. Simplified to always format on every startup instead
+(accepting that data doesn't survive a restart, a deliberate,
+documented trade-off favoring reliability over idempotency for this
+demo).
+
+**3d. A Docker named volume is root-owned by default; this image's
+process is not.** Even with formatting always attempted, it failed with
+`Cannot create directory /tmp/hadoop/dfs/name/current` — a classic
+Docker volume-ownership mismatch. Fixed by explicitly running the
+`namenode`/`datanode` containers as `user: "root"`.
+
+**With 3a–3d fixed, HDFS came up completely and was verified two
+independent ways**: its own logs showing `Leaving safe mode`, and
+directly querying its JMX endpoint from outside the container
+(`curl http://localhost:9870/jmx?...`), which returned `"State":
+"active"`.
+
+**3e. The Accumulo image's default behavior is to print help text and
+exit cleanly (code 0) — it needs an explicit server command.** The
+first `accumulo` container attempt showed `Exited (0)` with no error at
+all, because with no command override it just ran `accumulo help`.
+
+**3f. A `command:` override does not replace an image's `ENTRYPOINT` —
+it gets appended to it.** The first fix attempt (`command: bash -c
+"..."`, with no entrypoint change) resulted in an effective command of
+`accumulo bash -c "..."` — the `accumulo` script tried to interpret
+`bash` as a Java class name to run, and failed. Confirmed directly from
+the `COMMAND` column in `docker compose ps`. Fixed by explicitly
+clearing the entrypoint (`entrypoint: []`).
+
+**3g. Clearing the entrypoint alone then failed with `JAVA_HOME is not
+set`, even though it was confirmed present via a manual diagnostic.**
+The manual test (`docker compose run --entrypoint bash accumulo -c
+"..."`) used clean exec-form invocation and worked; the compose file's
+`command:` was a plain YAML string, which Compose treats as
+**shell-form**, implicitly wrapping it in an extra `/bin/sh -c "..."`
+layer that lost `JAVA_HOME` along the way. Fixed by using exec-form
+(YAML lists) for both `entrypoint` and `command`, matching the shape of
+the manual test that worked.
+
+**3h. Accumulo has a THIRD, separate configuration layer
+(`accumulo.properties`) that was never touched.** Even with Hadoop's
+own config correctly mounted, Accumulo's logs showed `Accumulo data
+dirs are [[hdfs://localhost:8020/accumulo]]` and `Zookeeper server is
+localhost:2181` — still hardcoded to `localhost`. Confirmed by directly
+inspecting the image's default `/opt/accumulo/conf/accumulo.properties`
+file, which hardcodes both `instance.volumes` and
+`instance.zookeeper.host`. Fixed by mounting a corrected version of
+this file, same pattern as the Hadoop config fix.
+
+**3i. A bash operator-precedence bug caused a genuine race
+condition.** `init && manager & tserver & wait` does not mean "run
+init, then start manager and tserver in parallel" — `&` has lower
+precedence than `&&`, so this actually parsed as `(init && manager) &`
+running as one background job, with `tserver &` starting as a
+completely separate, parallel job with no dependency on `init`
+finishing. Confirmed by the resulting crash: `Thread 'tserver' died ...
+Accumulo not initialized` — tserver genuinely raced ahead of init
+completing. Fixed by making `init` a real sequential statement with an
+explicit exit-code check, only starting `manager`/`tserver` afterward.
+Also fixed a second, related bug found in the same command: a bare
+`wait` always returns exit code 0 regardless of whether the background
+jobs actually succeeded, silently masking exactly this kind of failure
+— changed to `wait -n` to surface the real exit code.
+
+**3j. HDFS's own internal permission model blocked Accumulo from
+creating its own directory.** Even with the config and sequencing
+fixed, `init` failed with `Permission denied: user=accumulo,
+access=WRITE, inode="/":root:supergroup`. HDFS's root directory is
+owned by `root`, and the Accumulo container runs as a non-root
+`accumulo` user — a real permission layer independent of the Docker
+volume-ownership issue in 3d. Fixed by manually creating `/accumulo` in
+HDFS and chowning it to `accumulo:supergroup` from the `namenode`
+container (which does run as root).
+
+**3k. Two distinct confirmation prompts exist in Accumulo's own init
+code, and only one was suppressed.** With every prior issue fixed, init
+still failed with a bare `NullPointerException` at
+`Initialize.getInstanceNamePath`. Checked Accumulo's actual source code
+directly: `-f`/`--force` and `--clear-instance-name` suppress two
+**separate** prompts — the former for security-info reset, the latter
+for "this instance name already exists." Repeated retries against the
+same ZooKeeper state (without a full volume wipe each time) had left a
+stale `docker-instance` registration behind, triggering the second
+prompt, which calls `System.console().readLine()` — returning `null`
+with no tty attached to a background daemon container, causing the
+NPE. Fixed by adding `--clear-instance-name` alongside `-f`.
+
+**With all of 3a–3k fixed, Accumulo genuinely started and was verified
+independently, two ways**: its own logs showing the Root and Metadata
+system tables being assigned, hosted, and written to, and — the
+stronger proof — directly listing HDFS's filesystem from the outside
+(`hdfs dfs -ls -R /accumulo`), showing real `.rf` data files and
+write-ahead logs, owned by `accumulo:supergroup`, independent of
+anything Accumulo itself self-reported.
+
+**One remaining loose end, not chased further**: the Accumulo Monitor
+web UI (port 9995) did not come up, since only `manager` and `tserver`
+were started in the background command — `monitor` was never included.
+Not required to prove the core thesis (cell-level security), so left
+as a known, minor gap rather than a blocking issue.
+
 ## What's verified, and what genuinely isn't yet
 
 Everything in `security/`, `ingestion/`, and `tests/` runs with zero
@@ -66,14 +202,12 @@ end-to-end demonstration (100 entities, 574 total cells, three
 different clearance levels tested, zero classified values ever
 appearing in the Elasticsearch projection).
 
-`fusion/spark_fusion_job.py`, `fusion/es_projection_writer.py`, and
-`docker/docker-compose.yml` are **correct code and configuration
-written against each system's documented API and image, but have not
-been executed** — no Spark, Accumulo, Elasticsearch, Kafka, NiFi,
-ZooKeeper, or Hadoop cluster exists in this project's development
-environment. This is a meaningfully larger unverified surface than any
-prior project in this portfolio (which could at minimum push to a
-free, fast-to-provision Hugging Face Space) — running this stack for
-real requires a genuinely provisioned multi-service host, not a few
-minutes of CI time. See `docs/architecture.md` for exactly what
-running and verifying this stack for real would involve.
+As of incident #3 above, **HDFS and Accumulo have now actually been run
+for real** on a live Azure VM, with eleven distinct real fixes applied
+and independently verified — a meaningfully different and stronger
+claim than "correct code, unexecuted," which is what this section said
+before that debugging session happened. `fusion/spark_fusion_job.py`
+and `fusion/es_projection_writer.py` (the actual Spark job and ES
+indexer, as opposed to the infrastructure they'd run against) are still
+untested against this now-working cluster — the natural next step. See
+`docs/architecture.md` for the current, updated status.

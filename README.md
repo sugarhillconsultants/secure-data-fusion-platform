@@ -23,19 +23,26 @@ end-to-end run across 100 synthetic entities (574 total cells, three
 different clearance levels tested against the same data) that asserts
 **zero classified values ever appear in the Elasticsearch projection**.
 
-## Status: core security logic fully verified — the distributed stack is correct but unexecuted
+## Status: core security logic AND the real distributed stack both verified
 
 Everything in `security/`, `ingestion/`, and `tests/` runs with zero
 external dependencies, verified with 19 passing tests (see
-[`docs/incidents.md`](docs/incidents.md) for two genuine findings,
-including a constructed adversarial test proving a specific design
-choice matters). The real Spark/Accumulo/Elasticsearch pipeline and
-the 10-service docker-compose stack are correct code and configuration
-against documented APIs/images, but have **not been executed** — this
-project's development environment has no Docker, no JVM, no cluster of
-any kind. This is a meaningfully larger unverified surface than any
-prior project in this portfolio. Full honest breakdown:
-[`docs/architecture.md`](docs/architecture.md).
+[`docs/incidents.md`](docs/incidents.md) #1-2 for two genuine findings
+from that work). Beyond that: **ZooKeeper, HDFS, and Accumulo have now
+actually been run for real**, on a live Azure VM — not just written
+and assumed to work. Getting there took 11 distinct, real bugs, each
+found from an actual error and fixed in sequence (a nonexistent Docker
+image, missing Hadoop XML config, a Docker volume-ownership mismatch, a
+bash operator-precedence race condition, and Accumulo's own internal
+confirmation-prompt handling, among others — see
+[`docs/incidents.md`](docs/incidents.md) #3 for the full account).
+Confirmed independently two ways: HDFS's own JMX endpoint reporting
+`"State": "active"`, and a direct HDFS filesystem listing showing
+genuine Accumulo data files and write-ahead logs. Elasticsearch and
+Kibana were also confirmed running and healthy throughout. Kafka, NiFi,
+Spark, and the actual Spark→Accumulo fusion job remain unexecuted —
+see [`docs/architecture.md`](docs/architecture.md) for the precise,
+current split.
 
 ## What's actually in this repo
 
@@ -44,12 +51,12 @@ prior project in this portfolio. Full honest breakdown:
 | `security/visibility.py` | Accumulo-style visibility expression parser/evaluator | **Yes** — 9 tests |
 | `ingestion/generator.py` | Synthetic CTI fusion data (sensor+enrichment, analyst+HUMINT) | **Yes** — 5 tests |
 | `security/accumulo_sim.py` | In-memory access-control simulation + ES projection | **Yes** — 5 tests, including the full end-to-end security proof |
-| `fusion/spark_fusion_job.py` | Real Spark batch fusion job, writes to Accumulo via BatchWriter | Correct code, unexecuted |
-| `fusion/es_projection_writer.py` | Real Elasticsearch bulk-indexer | Correct code, unexecuted |
-| `docker/docker-compose.yml` | Full 10-service topology (ZK, Kafka, NiFi, HDFS, Spark, Accumulo, ES, Kibana) | Valid YAML, unexecuted |
+| `fusion/spark_fusion_job.py` | Real Spark batch fusion job, writes to Accumulo via BatchWriter | Correct code, not yet executed against the now-working cluster |
+| `fusion/es_projection_writer.py` | Real Elasticsearch bulk-indexer | Correct code, not yet executed against the now-working cluster |
+| `docker/docker-compose.yml` | Full 10-service topology (ZK, Kafka, NiFi, HDFS, Spark, Accumulo, ES, Kibana) | **ZooKeeper, HDFS, Accumulo, ES, Kibana: run for real, confirmed independently.** Kafka, NiFi, Spark: not yet run |
 | `tests/test_security.py` | 19 tests, all passing | **Yes** |
 | `docs/architecture.md` | Why Accumulo + ES, honest verified/unverified split | — |
-| `docs/incidents.md` | 2 real findings from building this project | — |
+| `docs/incidents.md` | 11+ real findings, including a full live debugging session on a real Azure VM | — |
 
 ## Running the verified parts yourself
 
@@ -70,26 +77,48 @@ print('ES projection contains:', len(project_to_elasticsearch(table)), 'document
 "
 ```
 
-## Running the full stack (unexecuted by me — this is genuinely your first real test)
+## Running the full stack yourself
+
+The trimmed core (ZooKeeper, HDFS, Accumulo, Elasticsearch, Kibana) is
+**confirmed working** — the commands below are exactly what was run to
+prove it, not a hopeful guess:
 
 ```bash
 cd docker
 cp .env.example .env   # fill in real passwords
-docker compose up
+git clone https://github.com/apache/accumulo-docker.git
+cd accumulo-docker && docker build -t accumulo:2.1.2 . && cd ..
+docker compose up -d zookeeper namenode datanode elasticsearch kibana accumulo
 ```
 
-Expect this to need real troubleshooting — see
-[`docs/architecture.md`](docs/architecture.md)'s prioritized list of
-what to check first.
+One manual step is still required after first boot — HDFS's own
+permission model blocks Accumulo from creating its own directory
+otherwise (see incident #3j):
+
+```bash
+docker compose exec namenode hdfs dfs -mkdir -p /accumulo
+docker compose exec namenode hdfs dfs -chown accumulo:supergroup /accumulo
+docker compose up -d accumulo   # retry after the chown
+```
+
+Kafka, NiFi, and Spark are defined in the same compose file but were
+deliberately excluded from this first real test — bringing those up
+too, and running the actual Spark fusion job against this now-working
+cluster, is the real next step (see below).
 
 ## What I'd add next
 
-1. **Actually run the docker-compose stack** and document what breaks —
-   the single biggest gap, and likely the richest incident log entry
-   this project will ever get, given how many services need to
-   correctly discover and authenticate to each other.
-2. Real-time fusion via NiFi/Kafka routing live per-event updates,
+1. **Run the actual `fusion/spark_fusion_job.py` and
+   `fusion/es_projection_writer.py` against the now-working cluster** —
+   the single biggest remaining gap. The infrastructure is proven; the
+   application-level fusion logic running on top of it isn't yet.
+2. Bring up Kafka, NiFi, and Spark (deliberately excluded from the
+   first real test) and confirm they integrate correctly.
+3. Start the Accumulo Monitor process (port 9995 came up on the
+   network but nothing was listening, since only `manager`/`tserver`
+   were launched — a known, minor, documented gap).
+4. Real-time fusion via NiFi/Kafka routing live per-event updates,
    replacing the current batch-file approach.
-3. RFile bulk-load, replacing BatchWriter for production-scale ingestion.
-4. A Kibana dashboard definition (currently just the raw ES index — no
+5. RFile bulk-load, replacing BatchWriter for production-scale ingestion.
+6. A Kibana dashboard definition (currently just the raw ES index — no
    actual hunt-analyst-facing visualization has been built yet).

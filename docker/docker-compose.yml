@@ -1,5 +1,3 @@
-version: "3.8"
-
 # Full topology matching this project's target architecture. NOT
 # executed/verified in this project's development environment — no
 # Docker or network access there. Correct compose syntax against known,
@@ -53,21 +51,44 @@ services:
 
   namenode:
     image: apache/hadoop:3.3.6
-    command: ["hdfs", "namenode"]
+    # Confirmed necessary the hard way: the format step failed with
+    # "java.io.IOException: Cannot create directory
+    # /tmp/hadoop/dfs/name/current" — a fresh Docker named volume is
+    # root-owned by default, and this image's default non-root user
+    # lacks write access to it. Running as root sidesteps this
+    # mismatch entirely; a more production-correct fix would chown the
+    # volume to the image's actual hadoop user in an init step instead,
+    # but running as root is a reasonable, explicitly-documented
+    # trade-off for this demo, consistent with other simplifications
+    # already made elsewhere in this project. See docs/incidents.md.
+    user: "root"
+    # The made-up ENSURE_NAMENODE_DIR env var from the original version
+    # of this file did nothing — Hadoop's real configuration model is
+    # XML files, not arbitrary environment variables. Confirmed by the
+    # actual failure: "Invalid URI for NameNode address (check
+    # fs.defaultFS): file:/// has no authority." Fixed via the mounted
+    # core-site.xml/hdfs-site.xml below.
+    command: ["bash", "-c", "hdfs namenode -format -force -nonInteractive && hdfs namenode"]
     ports:
       - "9870:9870"
-    environment:
-      ENSURE_NAMENODE_DIR: /tmp/hadoop/dfs/name
     volumes:
       - hdfs-namenode:/tmp/hadoop/dfs/name
+      - ./hadoop-config/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro
+      - ./hadoop-config/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro
 
   datanode:
     image: apache/hadoop:3.3.6
+    # Same root-user fix as namenode above — the datanode writes to its
+    # own separate named volume and would hit the identical ownership
+    # mismatch once it actually starts trying to store blocks.
+    user: "root"
     command: ["hdfs", "datanode"]
     depends_on:
       - namenode
     volumes:
       - hdfs-datanode:/tmp/hadoop/dfs/data
+      - ./hadoop-config/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro
+      - ./hadoop-config/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro
 
   spark-master:
     image: bitnami/spark:3.5
@@ -88,7 +109,59 @@ services:
       - ./fusion:/opt/fusion:ro
 
   accumulo:
-    image: apache/accumulo:2.1.2
+    # NOTE: there is no official prebuilt apache/accumulo image on Docker
+    # Hub — confirmed by Apache's own accumulo-docker repo README, which
+    # states this plainly. Build it locally first:
+    #   git clone https://github.com/apache/accumulo-docker.git
+    #   cd accumulo-docker && docker build -t accumulo:2.1.2 .
+    # The default build produces exactly Accumulo 2.1.2 + Hadoop 3.3.6 +
+    # ZooKeeper 3.8.2 — matching the versions already used elsewhere in
+    # this compose file, so no version mismatch results from this fix.
+    image: accumulo:2.1.2
+    # The image's ENTRYPOINT is the `accumulo` script itself. A plain
+    # `command:` override does NOT replace an image's ENTRYPOINT — it
+    # gets appended as arguments to it. Confirmed by the actual failure:
+    # `docker compose ps` showed the effective command as
+    # "accumulo bash -c '...'". Fixed by explicitly clearing the
+    # entrypoint (entrypoint: []) — but that alone then failed with
+    # "JAVA_HOME is not set and could not be found", even though
+    # JAVA_HOME was confirmed present when tested manually via
+    # `docker compose run --entrypoint bash accumulo -c "..."`. The
+    # difference: that manual test used exec-form invocation (a clean,
+    # direct bash -c call), while the compose file's `command:` was a
+    # plain YAML string — which Compose treats as SHELL-FORM, implicitly
+    # wrapping it in `/bin/sh -c "..."`. That nested our own `bash -c`
+    # inside an extra shell layer, which lost JAVA_HOME along the way.
+    # Fixed by using exec-form (YAML lists) for both entrypoint and
+    # command, exactly matching the invocation shape that worked
+    # manually. See docs/incidents.md.
+    entrypoint: ["bash", "-c"]
+    # NOTE: a bare `wait` (no arguments) always returns exit code 0 once
+    # all background jobs finish, REGARDLESS of whether they actually
+    # succeeded — using `wait -n` instead surfaces the actual exit code
+    # of whichever background job finishes first.
+    #
+    # A REAL, subtle bug found here: the original version of this
+    # command chained `init && manager &` followed by a separate
+    # `tserver &` — but `&` has LOWER precedence than `&&` in bash, so
+    # this actually parsed as `(init && manager) &` running as ONE
+    # background job, while `tserver &` started as a SEPARATE, parallel
+    # background job with no dependency on init finishing at all.
+    # Confirmed by the actual failure: "Thread 'tserver' died ...
+    # Accumulo not initialized, there is no instance id" — tserver
+    # raced ahead and tried to start before init had finished writing
+    # the instance ID to HDFS. Fixed by running init as a genuinely
+    # sequential statement (semicolon-separated, not &&-chained into
+    # the same backgroundable unit) with an explicit exit-code check,
+    # so manager/tserver only ever start after init has actually and
+    # verifiably completed. See docs/incidents.md.
+    command:
+      - >
+        accumulo init --instance-name docker-instance --password $$ACCUMULO_ROOT_PASSWORD -f --clear-instance-name;
+        if [ $$? -ne 0 ]; then echo "Accumulo init failed" >&2; exit 1; fi;
+        accumulo manager &
+        accumulo tserver &
+        wait -n
     depends_on:
       - zookeeper
       - namenode
@@ -96,9 +169,27 @@ services:
       - "9995:9995"
       - "9099:9099"
     environment:
-      ZOOKEEPER_HOST: zookeeper:2181
-      HDFS_NAMENODE: namenode:9000
+      # ZOOKEEPER_HOST/HDFS_NAMENODE from earlier versions of this file
+      # were never real settings this image recognizes — confirmed by
+      # inspecting the actual accumulo.properties file, which uses
+      # instance.zookeeper.host / instance.volumes instead, now set
+      # correctly via the mounted config file above.
       ACCUMULO_ROOT_PASSWORD: ${ACCUMULO_ROOT_PASSWORD}
+    volumes:
+      # Confirmed via direct inspection (find / -name 'core-site.xml')
+      # that this image's bundled Hadoop client looks for its config at
+      # exactly this path — the same one already mounted into
+      # namenode/datanode. This mount was missing entirely, which is why
+      # Accumulo fell back to Hadoop's hardcoded default (localhost:8020)
+      # instead of finding the real namenode.
+      - ./hadoop-config/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro
+      - ./hadoop-config/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro
+      # A SEPARATE, THIRD config layer — Accumulo's own
+      # accumulo.properties, independent of the Hadoop core-site.xml
+      # fix above. Confirmed via `cat` on the image's default file that
+      # instance.volumes and instance.zookeeper.host were also both
+      # hardcoded to localhost. See docs/incidents.md.
+      - ./accumulo-config/accumulo.properties:/opt/accumulo/conf/accumulo.properties:ro
 
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+  <property>
+    <name>dfs.replication</name>
+    <value>1</value>
+    <!-- Single datanode in this trimmed stack — 1 is correct, not a
+         placeholder. A real multi-node deployment would raise this. -->
+  </property>
+  <property>
+    <name>dfs.namenode.name.dir</name>
+    <value>/tmp/hadoop/dfs/name</value>
+  </property>
+  <property>
+    <name>dfs.datanode.data.dir</name>
+    <value>/tmp/hadoop/dfs/data</value>
+  </property>
+</configuration>

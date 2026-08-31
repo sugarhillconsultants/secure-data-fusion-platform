@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Confirmed necessary the hard way: the namenode container crashed with
+"Invalid URI for NameNode address (check fs.defaultFS): file:/// has
+no authority" because no core-site.xml existed at all, and Hadoop
+defaulted fs.defaultFS to the local filesystem instead of HDFS. See
+docs/incidents.md for the full account — this project initially (and
+wrongly) assumed the apache/hadoop image could be configured via
+environment variables the way Kafka/Elasticsearch's images can;
+Hadoop's actual configuration model is XML files like this one.
+-->
+<configuration>
+  <property>
+    <name>fs.defaultFS</name>
+    <value>hdfs://namenode:9000</value>
+  </property>
+</configuration>

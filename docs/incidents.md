@@ -301,6 +301,155 @@ real crash-recovery log messages (`recovered 0 mutations ... from 0
 walogs`) confirming Accumulo's own internal consistency checks passed
 cleanly against the persisted data.
 
+## 5. Bringing up Spark and running the real fusion pipeline end to end: eight more distinct findings, plus the final security proof
+
+Everything in incidents #3 and #4 proved ZooKeeper, HDFS, and Accumulo
+work and persist correctly. This session went the rest of the way:
+bringing up Spark for the first time, generating and landing real data,
+running the actual fusion job, compiling and running the Java
+Accumulo writer, and — the real point of this entire project —
+verifying the cell-level security model against genuinely deployed,
+genuinely fused data rather than the in-memory simulator alone.
+
+**5a. `bitnami/spark:3.5` no longer exists as a usable image — a real
+deprecation, not a typo.** `docker compose up` failed with
+`docker.io/bitnami/spark:3.5: not found`. Checking Docker Hub directly
+confirmed: the `bitnami/spark` repository shows "No tags have been
+pushed," and Bitnami's own current docs state plainly that the Apache
+Spark image is now "only available to Bitnami Secure Images
+customers" — part of Broadcom's 2025 restructuring of Bitnami's free
+image catalog. Fixed by switching to `apache/spark:3.5.0`, the
+official image published directly by the Apache Software Foundation.
+
+**5b. The official image doesn't have Bitnami's convenience
+environment-variable wrapper.** `SPARK_MODE=master/worker` (Bitnami's
+pattern) does nothing on `apache/spark`. Confirmed the real, available
+launcher by listing the image's own `/opt/spark/bin` and
+`/opt/spark/sbin` directly rather than guessing: `spark-class` runs a
+master/worker process directly in the foreground (correct for
+Docker's single-process container model), while the `sbin/start-*.sh`
+scripts fork a background daemon and return immediately (wrong for
+Docker — the container would see its main process exit right away).
+Fixed by setting `command: ["/opt/spark/bin/spark-class",
+"org.apache.spark.deploy.master.Master"]` (and the `Worker` equivalent)
+directly.
+
+**5c. A real relative-path bug: `./fusion` resolved relative to the
+compose file's own folder, not the repo root.** `spark-submit` failed
+with `can't open file '/opt/fusion/generate_and_land_data.py': No such
+file or directory`, even though the volume mount appeared to succeed
+with no error. The real cause: Docker silently auto-creates a bind
+mount's source directory on the host if it doesn't exist, rather than
+erroring — so `./fusion` (relative to `docker-compose.yml`, which
+lives in `docker/`) silently created an empty `docker/fusion/` on the
+host and mounted that, instead of the real `fusion/` directory one
+level up. Confirmed by finding these exact stray, empty, root-owned
+directories sitting in `docker/`. Fixed by changing the paths to
+`../fusion` and `../ingestion`.
+
+**5d. This project's own type hints broke under the Spark image's
+bundled Python 3.8.** `generate_and_land_data.py` failed importing
+`ingestion.generator` with `TypeError: 'type' object is not
+subscriptable` on `list[Cell]` — PEP 585 lowercase generic
+subscripting, which only works natively in Python 3.9+. Every piece of
+this project's Python had been written and tested against a newer
+Python; this was the first time any of it ran under 3.8. Fixed with
+`from __future__ import annotations` (making all annotations lazily-
+evaluated strings, sidestepping the incompatibility with zero logic
+changes) in `ingestion/generator.py`, and proactively in
+`security/visibility.py` and `security/accumulo_sim.py` too, since
+they have the identical pattern even though nothing in today's
+pipeline currently imports them under Python 3.8.
+
+**5e. `hdfs:///path` (no explicit host) doesn't resolve without a
+Hadoop config Spark was never given.** The write step failed with
+`Incomplete HDFS URI, no host`. Unlike `namenode`/`datanode`/
+`accumulo`, the Spark containers were never given `core-site.xml`
+(which would supply `fs.defaultFS`). Rather than mount config into
+Spark too (adding the uncertainty of also needing `HADOOP_CONF_DIR`
+set correctly), the simpler, more certain fix: write the fully-
+qualified URI (`hdfs://namenode:9000/...`) directly in both
+`generate_and_land_data.py` and `spark_fusion_job.py`.
+
+**5f. HDFS's own permission model blocked `spark` from writing to
+new top-level directories — the same category of bug as incident #3j,
+now against a different user.** `AccessControlException:
+Permission denied: user=spark, access=WRITE, inode="/"`. Fixed the
+same way as before: manually created `/bronze` and
+`/accumulo-staging` and chowned them to `spark:supergroup` from the
+`namenode` container (which runs as root, HDFS's actual superuser).
+
+**5g. The Accumulo image ships a JRE, not a full JDK — `javac` was
+never present.** Confirmed directly (`command -v javac` returned
+nothing) rather than assumed. The image runs Rocky Linux 9.3, with
+`dnf` available and genuine outbound network access to Rocky's package
+repos, confirmed by successfully installing `java-11-openjdk-devel`
+(matching the already-present JRE's major version) directly into the
+running container.
+
+**5h. `javac` defaulted to US-ASCII, rejecting this project's own
+em-dashes in its comments.** A purely cosmetic issue, not a code bug —
+the file's own documentation style (em-dashes throughout, consistent
+with every other file in this portfolio) isn't valid ASCII. Fixed with
+`javac -encoding UTF-8`, after which the file compiled cleanly on the
+very next attempt — the first time `AccumuloBulkWriter.java` had ever
+met a real compiler, and the actual Java logic (written against
+Accumulo's documented `AccumuloClient`/`BatchWriter` API, entirely
+unverified until this point) was correct on the first genuine attempt.
+
+**Confirmed end to end**: `generate_and_land_data.py` generated and
+landed 1,000 sensor/enrichment cells and 144 analyst/intel cells as
+real Parquet in HDFS (independently confirmed via `hdfs dfs -ls -R`,
+not just the job's own self-report). `spark_fusion_job.py` fused both
+feeds and wrote exactly 1,144 cells as TSV to HDFS (matching the sum
+precisely). `AccumuloBulkWriter.java` loaded exactly 1,144 cells into a
+real Accumulo table — zero data loss anywhere across the full chain.
+
+### The final security proof — and a genuine near-miss worth documenting honestly
+
+The actual point of this entire project: verifying cell-level security
+against this real, Spark-fused data, not just the in-memory simulator.
+The first attempt produced a result that looked like a serious
+failure: scanning the real table as `root` with `-s U` (intending to
+restrict the scan to only the unclassified authorization) showed
+`attribution:` and `humint:` cells anyway — exactly the classified
+content that should have been invisible.
+
+Rather than either declare success prematurely or panic and declare a
+critical security failure, the honest next step was to question the
+test's own validity before questioning the system under test:
+`root` is Accumulo's superuser, and superusers commonly bypass
+authorization checks that apply to ordinary accounts — a real,
+plausible alternative explanation that needed ruling in or out
+directly, not assumed.
+
+Created a genuinely restricted, non-superuser test account
+(`createuser analyst`), granted it only the `U` authorization
+(`setauths -u analyst -s U`) and read access to the table
+(`grant Table.READ`), and reconnected as that account specifically —
+hitting two more minor, real setup snags along the way (the shell
+needs `-zi`/`-zh` flags for instance name/ZooKeeper host when not
+using the default config path; and needs `-p stdin` explicitly to
+trigger an interactive password prompt, rather than inferring it from
+omitting `-p` entirely).
+
+Scanning as `analyst` with `-s U`, using `-np -o <file>` to capture the
+**complete, non-paginated** result rather than eyeballing a scrolling
+terminal: **1,000 lines returned, and a direct `grep` for
+"attribution" or "humint" across the entire file returned zero
+matches.** A genuinely restricted, non-superuser account holding only
+`U` saw exactly the 200 entities' worth of unclassified sensor/
+enrichment cells (5 fields each) and nothing else — out of 144
+classified cells that genuinely exist in the same table. `root`'s
+earlier result is fully explained by superuser bypass, not a real gap.
+
+This is the project's core thesis, proven against real infrastructure,
+not simulation: Accumulo's cell-level visibility model, running on a
+real cluster, correctly enforced by a real restricted account, against
+data that flowed through a real Spark cluster and a real,
+first-time-ever-compiled Java writer — with zero classified leakage,
+definitively confirmed by a complete scan, not a sample.
+
 ## What's verified, and what genuinely isn't yet
 
 Everything in `security/`, `ingestion/`, and `tests/` runs with zero
@@ -311,13 +460,20 @@ different clearance levels tested, zero classified values ever
 appearing in the Elasticsearch projection).
 
 As of incident #3, HDFS and Accumulo were first run for real on a live
-Azure VM. As of incident #4, this stack has now been confirmed to
-**survive a genuine stop/restart cycle end to end with zero manual
-steps** — a meaningfully stronger and more production-relevant claim
-than "ran once in a continuous session," since real deployments get
-restarted, redeployed, and rebooted routinely.
-`fusion/spark_fusion_job.py` and `fusion/es_projection_writer.py` (the
-actual Spark job and ES indexer, as opposed to the infrastructure
-they'd run against) remain untested against this now-working,
-now-persistent cluster — the immediate next step. See
-`docs/architecture.md` for the current, updated status.
+Azure VM. As of incident #4, this stack was confirmed to survive a
+genuine stop/restart cycle end to end with zero manual steps. As of
+incident #5, **the entire pipeline this project was built to
+demonstrate has now been run for real, start to finish**: synthetic
+data generation, a real two-node Spark cluster, a real fusion job,
+a real (first-time-compiled) Java Accumulo writer, and — the actual
+point of the whole project — a real, restricted, non-superuser account
+correctly denied all classified content in a complete, definitive scan
+of genuinely deployed data.
+
+What remains genuinely open: `fusion/es_projection_writer.py` (the
+Elasticsearch side of the projection) hasn't been run against this
+live cluster yet — the data currently lives in Accumulo only. Kafka
+and NiFi (the real-time ingestion path this project's batch-first
+design was always meant to evolve toward) remain unexecuted. The
+Accumulo Monitor web UI still isn't started (incident #3's noted gap).
+See `docs/architecture.md` for the current, precise status.

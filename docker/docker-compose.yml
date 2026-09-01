@@ -158,26 +158,38 @@ services:
       - ./hadoop-config/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro
 
   spark-master:
-    image: bitnami/spark:3.5
-    environment:
-      SPARK_MODE: master
+    # NOTE: bitnami/spark no longer has any free, usable tags on Docker
+    # Hub — confirmed the hard way: "docker.io/bitnami/spark:3.5: not
+    # found". Checking Bitnami's own current docs confirmed this is a
+    # real deprecation, not a typo: Broadcom moved the Apache Spark
+    # image behind a commercial "Bitnami Secure Images" paywall in
+    # their 2025 catalog restructuring. Switched to the official,
+    # currently-free `apache/spark` image published directly by the
+    # Apache Software Foundation. This image doesn't have Bitnami's
+    # convenience SPARK_MODE=master/worker environment-variable
+    # wrapper, so master/worker are started directly via `spark-class`
+    # (confirmed present at this exact path by listing the image's own
+    # /opt/spark/bin directory) rather than the sbin/start-*.sh scripts,
+    # which fork a background daemon and return immediately — wrong for
+    # Docker's single-foreground-process container model. See
+    # docs/incidents.md.
+    image: apache/spark:3.5.0
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
     ports:
       - "8080:8080"
       - "7077:7077"
     volumes:
-      - ./fusion:/opt/fusion:ro
-      - ./ingestion:/opt/ingestion:ro
+      - ../fusion:/opt/fusion:ro
+      - ../ingestion:/opt/ingestion:ro
 
   spark-worker:
-    image: bitnami/spark:3.5
+    image: apache/spark:3.5.0
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
     depends_on:
       - spark-master
-    environment:
-      SPARK_MODE: worker
-      SPARK_MASTER_URL: spark://spark-master:7077
     volumes:
-      - ./fusion:/opt/fusion:ro
-      - ./ingestion:/opt/ingestion:ro
+      - ../fusion:/opt/fusion:ro
+      - ../ingestion:/opt/ingestion:ro
 
   accumulo:
     # NOTE: there is no official prebuilt apache/accumulo image on Docker

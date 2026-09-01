@@ -18,6 +18,10 @@ analysts with NO clearance verification at query time — unlike
 Accumulo, which checks authorizations on every single scan.
 """
 
+# Same Python 3.8 compatibility fix as ingestion/generator.py — see
+# that file's comment and docs/incidents.md for the full explanation.
+from __future__ import annotations
+
 from ingestion.generator import Cell
 from security.visibility import evaluate_visibility
 

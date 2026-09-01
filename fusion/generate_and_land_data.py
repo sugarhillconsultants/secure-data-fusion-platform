@@ -5,8 +5,8 @@ Generates the synthetic CTI dataset (reusing ingestion/generator.py's
 already-verified logic — 19 tests, see tests/test_security.py) and
 lands it in HDFS as Parquet, at the exact paths
 fusion/spark_fusion_job.py expects to read from:
-  hdfs:///bronze/sensor_enrichment/
-  hdfs:///bronze/analyst_intel/
+  hdfs://namenode:9000/bronze/sensor_enrichment/
+  hdfs://namenode:9000/bronze/analyst_intel/
 
 This is the step that stands in for NiFi's real job in this project's
 target architecture (see docs/architecture.md's batch-first scoping
@@ -35,8 +35,15 @@ from pyspark.sql.types import StructType, StructField, StringType, LongType
 sys.path.insert(0, "/opt")
 from ingestion.generator import generate_dataset
 
-HDFS_SENSOR_PATH = "hdfs:///bronze/sensor_enrichment/"
-HDFS_INTEL_PATH = "hdfs:///bronze/analyst_intel/"
+HDFS_SENSOR_PATH = "hdfs://namenode:9000/bronze/sensor_enrichment/"
+HDFS_INTEL_PATH = "hdfs://namenode:9000/bronze/analyst_intel/"
+# Confirmed necessary the hard way: "hdfs:///path" (no explicit host)
+# only resolves correctly if Spark has been given fs.defaultFS via a
+# mounted Hadoop config — which it isn't, unlike namenode/datanode/
+# accumulo. Rather than mount config into Spark too (which would also
+# need HADOOP_CONF_DIR set correctly, adding uncertainty), the fully-
+# qualified URI here is the simpler, more certain fix. See
+# docs/incidents.md.
 
 CELL_SCHEMA = StructType([
     StructField("row", StringType(), False),

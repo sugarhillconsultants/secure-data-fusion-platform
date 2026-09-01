@@ -35,9 +35,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from pyspark.sql import SparkSession
 
-HDFS_SENSOR_PATH = "hdfs:///bronze/sensor_enrichment/"
-HDFS_INTEL_PATH = "hdfs:///bronze/analyst_intel/"
-HDFS_FUSED_OUTPUT_PATH = "hdfs:///accumulo-staging/fused_cells"
+HDFS_SENSOR_PATH = "hdfs://namenode:9000/bronze/sensor_enrichment/"
+HDFS_INTEL_PATH = "hdfs://namenode:9000/bronze/analyst_intel/"
+HDFS_FUSED_OUTPUT_PATH = "hdfs://namenode:9000/accumulo-staging/fused_cells"
 
 
 def read_source_feeds(spark: SparkSession):

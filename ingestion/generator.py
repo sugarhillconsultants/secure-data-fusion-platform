@@ -22,6 +22,18 @@ Accumulo's cell-level visibility model exists to handle, and what a
 row-level or table-level access control scheme cannot.
 """
 
+# Confirmed necessary the hard way: this project's own type hints
+# (list[Cell], tuple[list[Cell], list[Cell]], etc.) use PEP 585
+# lowercase generic subscripting, which only works natively in Python
+# 3.9+. The apache/spark:3.5.0 image bundles Python 3.8.10 — running
+# this file there failed immediately with "TypeError: 'type' object is
+# not subscriptable" the moment Python tried to actually evaluate
+# `list[Cell]` as a real expression at import time. This future-import
+# makes all annotations lazily-evaluated strings instead, sidestepping
+# the incompatibility with zero changes to actual logic. See
+# docs/incidents.md.
+from __future__ import annotations
+
 import random
 from dataclasses import dataclass, field
 

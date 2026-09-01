@@ -22,6 +22,14 @@ that "A&B|C" is rejected as ambiguous — you must write "(A&B)|C" or
 "A&(B|C)" explicitly).
 """
 
+# Same Python 3.8 compatibility fix as ingestion/generator.py — see
+# that file's comment and docs/incidents.md for the full explanation.
+# Not currently exercised under Python 3.8 (nothing in today's Spark
+# pipeline imports this module), but fixed proactively since the cost
+# is zero and the alternative is hitting this same landmine again
+# later.
+from __future__ import annotations
+
 import re
 from dataclasses import dataclass
 
